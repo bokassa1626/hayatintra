@@ -1,0 +1,260 @@
+// ============================================================================
+// Schéma de base de données — Plateforme Intranet HAYATCOM (prototype web)
+// SGBD : MySQL
+// ============================================================================
+// Ce schéma traduit directement le diagramme de classes (Figure 3.2 du rapport)
+// et les tables listées au §5 du prompt maître.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// UTILISATEURS, RÔLES, PERMISSIONS (RBAC calqué sur l'organigramme HAYATCOM)
+// ---------------------------------------------------------------------------
+
+enum Direction {
+  DIRECTION_PAYS
+  REGIONALE
+  COMMERCIALE
+  FINANCE
+  RESSOURCES_HUMAINES
+  QUALITE
+  OPERATIONS_MS
+  ENTREPOT
+  TERRAIN_FME
+}
+
+enum Operateur {
+  AIRTEL
+  VODACOM
+  ORANGE
+  RCS
+  FUEL
+  AUCUN // pour les rôles transverses (RH, Finance, Admin...)
+}
+
+model Role {
+  id          Int              @id @default(autoincrement())
+  nom         String           @unique // ex: ADMIN, COUNTRY_MANAGER, CHEF_PROJET_MS, FME, MANAGER, WAREHOUSE
+  description String?
+  users       User[]
+  permissions RolePermission[]
+  createdAt   DateTime         @default(now())
+
+  @@map("roles")
+}
+
+model Permission {
+  id        Int              @id @default(autoincrement())
+  action    String // ex: CREATE, READ, UPDATE, DELETE, MANAGE
+  ressource String // ex: USER, MESSAGE, FICHIER, DOSSIER, AUDIT_LOG, RAPPORT
+  roles     RolePermission[]
+
+  @@unique([action, ressource])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       Int
+  permissionId Int
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model User {
+  id              Int       @id @default(autoincrement())
+  nom             String
+  prenom          String
+  email           String    @unique
+  motDePasseHash  String
+  roleId          Int
+  role            Role      @relation(fields: [roleId], references: [id])
+  direction       Direction
+  operateur       Operateur @default(AUCUN)
+  managerId       Int? // supérieur hiérarchique direct (pour l'organigramme)
+  manager         User?     @relation("Hierarchie", fields: [managerId], references: [id])
+  subordonnes     User[]    @relation("Hierarchie")
+  actif           Boolean   @default(true)
+  dateCreation    DateTime  @default(now())
+  derniereConnexion DateTime?
+
+  // Relations
+  messagesEnvoyes      Message[]             @relation("Expediteur")
+  messagesRecus         MessageDestinataire[]
+  dossiersCrees         Dossier[]
+  fichiersAjoutes       Fichier[]
+  rapportsActivite      RapportActivite[]
+  actionsAudit          AuditLog[]
+  refreshTokens         RefreshToken[]
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// AUTHENTIFICATION (SSO simulé via JWT)
+// ---------------------------------------------------------------------------
+
+model RefreshToken {
+  id        Int      @id @default(autoincrement())
+  token     String   @unique @db.VarChar(512)
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expireLe  DateTime
+  revoque   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// MESSAGERIE INTERNE (simulation Postfix/Dovecot — voir chapitre 2.2.2 du rapport)
+// ---------------------------------------------------------------------------
+
+enum StatutMessage {
+  ENVOYE
+  REMIS
+  LU
+}
+
+model Message {
+  id             Int                   @id @default(autoincrement())
+  expediteurId   Int
+  expediteur     User                  @relation("Expediteur", fields: [expediteurId], references: [id])
+  sujet          String
+  corps          String                @db.Text
+  dateEnvoi      DateTime              @default(now())
+  statut         StatutMessage         @default(ENVOYE)
+  supprimeExp    Boolean               @default(false) // corbeille côté expéditeur
+  destinataires  MessageDestinataire[]
+  piecesJointes  PieceJointe[]
+
+  @@map("messages")
+}
+
+model MessageDestinataire {
+  id              Int       @id @default(autoincrement())
+  messageId       Int
+  message         Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  destinataireId  Int
+  destinataire    User      @relation(fields: [destinataireId], references: [id])
+  lu              Boolean   @default(false)
+  dateLecture     DateTime?
+  supprimeDest    Boolean   @default(false) // corbeille côté destinataire
+
+  @@unique([messageId, destinataireId])
+  @@map("message_destinataires")
+}
+
+// ---------------------------------------------------------------------------
+// PARTAGE DE FICHIERS (simulation Samba/SMB — voir chapitre 2.2.3 du rapport)
+// ---------------------------------------------------------------------------
+
+model Dossier {
+  id           Int        @id @default(autoincrement())
+  nom          String
+  parentId     Int?
+  parent       Dossier?   @relation("Arborescence", fields: [parentId], references: [id])
+  enfants      Dossier[]  @relation("Arborescence")
+  direction    Direction?
+  operateur    Operateur  @default(AUCUN) // cloisonnement par opérateur
+  proprietaireId Int
+  proprietaire User       @relation(fields: [proprietaireId], references: [id])
+  fichiers     Fichier[]
+  dateCreation DateTime   @default(now())
+
+  @@map("dossiers")
+}
+
+model Fichier {
+  id            Int           @id @default(autoincrement())
+  dossierId     Int
+  dossier       Dossier       @relation(fields: [dossierId], references: [id], onDelete: Cascade)
+  nom           String
+  chemin        String // chemin sur le disque du serveur (/uploads/...)
+  taille        Int // en octets
+  version       Int           @default(1)
+  historique    String?       @db.Text // JSON des 2 versions précédentes (voir §Itération 3)
+  supprime      Boolean       @default(false) // corbeille
+  dateAjout     DateTime      @default(now())
+  ajouteParId   Int
+  ajoutePar     User          @relation(fields: [ajouteParId], references: [id])
+  piecesJointes PieceJointe[]
+
+  @@map("fichiers")
+}
+
+// Pièce jointe : peut être liée à un message OU être une copie référencée dans l'espace fichiers
+model PieceJointe {
+  id         Int      @id @default(autoincrement())
+  messageId  Int?
+  message    Message? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  fichierId  Int?
+  fichier    Fichier? @relation(fields: [fichierId], references: [id], onDelete: Cascade)
+  nomFichier String
+  chemin     String
+  taille     Int
+  type       String // MIME type
+
+  @@map("pieces_jointes")
+}
+
+// ---------------------------------------------------------------------------
+// RAPPORTS D'ACTIVITÉ FME (chapitre 1.3.3 du rapport)
+// ---------------------------------------------------------------------------
+
+model RapportActivite {
+  id            Int       @id @default(autoincrement())
+  technicienId  Int
+  technicien    User      @relation(fields: [technicienId], references: [id])
+  operateur     Operateur
+  zone          String
+  date          DateTime
+  description   String    @db.Text
+  dateCreation  DateTime  @default(now())
+
+  @@map("rapports_activite")
+}
+
+// ---------------------------------------------------------------------------
+// JOURNAL D'AUDIT (traçabilité — chapitre 2.2.4 et §2.3.1 du rapport)
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id           Int      @id @default(autoincrement())
+  userId       Int?
+  user         User?    @relation(fields: [userId], references: [id])
+  action       String // ex: LOGIN, LOGOUT, SEND_MESSAGE, UPLOAD_FILE, DELETE_FILE, CHANGE_ROLE
+  ressource    String? // ex: "Fichier#42", "User#7"
+  ressourceId  Int?
+  details      String?  @db.Text
+  ip           String?
+  dateAction   DateTime @default(now())
+
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// SIMULATEUR RÉSEAU (Itération 5 — remplace le diagramme de déploiement réel)
+// ---------------------------------------------------------------------------
+
+model NoeudReseau {
+  id          Int      @id @default(autoincrement())
+  nom         String // ex: "Client Web", "Serveur Applicatif", "Serveur Mail (simulé)"
+  type        String // CLIENT, APP_SERVER, MAIL_SERVER, FILE_SERVER, DB_SERVER
+  actif       Boolean  @default(true) // togglable pour la démo
+  positionX   Int      @default(0)
+  positionY   Int      @default(0)
+  description String?
+
+  @@map("noeuds_reseau")
+}
